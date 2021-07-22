@@ -159,7 +159,10 @@ int main(void)
 		if (earliest_slot == -1) continue;
 
 		// Can we transmit any additional events right after it?
+		// TODO: Try again once I find out how to increase the serial buffer size
+		// (without that it does not work)
 		transmit_n = 1;
+		/*
 		for (int i = earliest_slot + 1; i < FIFO_NUMWF; i++){
 			if (fifo_status[i] == SLOT_FULL){
 				transmit_n += 1;
@@ -167,6 +170,7 @@ int main(void)
 				break;
 			}
 		}
+		*/
 
 		transmitting_slot = earliest_slot;
 		for (int i = 0; i < transmit_n; i++){
@@ -419,7 +423,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 2000000;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
