@@ -37,8 +37,9 @@
 /* USER CODE BEGIN PD */
 #define ADC_BUF_LEN 2064
 #define ADC_BUF_HLEN ADC_BUF_LEN/2
-#define FIFO_WFLEN 500
-#define FIFO_NUMWF 8
+#define HEADER_LEN 23   // 2 for trigger_number, 21 for datestring
+#define SAMPLES_IN_EVENT 500
+#define FIFO_NUMWF 1
 #define WF_PRE_SAMPLES 50
 
 #define SLOT_FREE 0
@@ -68,19 +69,17 @@ RTC_TimeTypeDef sTime;
 RTC_DateTypeDef sDate;
 
 uint16_t adc_buf[ADC_BUF_LEN];
-uint16_t fifo[FIFO_NUMWF][FIFO_WFLEN];
+unsigned char fifo[FIFO_NUMWF][HEADER_LEN + 2 * SAMPLES_IN_EVENT];
 uint16_t trig_threshold = 100;
-uint8_t fifo_status;
+
+uint16_t event_number;
 /* the register where the threshold was meet, so need to be able to hold a value
  * up to ADC_BUF_LEN */
-uint16_t active_trigger;
-char tx_dma_buffer[2000]; // for the UART2 TX buffer
+int16_t active_trigger;
 
-char datetime_str[25];
-
+uint8_t fifo_status;
 int transmitting;
 
-uint16_t tmp_a, tmp_b, tmp_c, tmp_d;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -144,24 +143,10 @@ int main(void)
   /* USER CODE BEGIN WHILE */
 	while (1)
 	{
-		if ((fifo_status == SLOT_USED)){
-			HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
-			HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-			int fsec = (999 - sTime.SubSeconds*1000 / sTime.SecondFraction);
-			if (fsec < 0){ fsec=0;}
-			else if (fsec > 999){fsec=0;}
-			sprintf(datetime_str, "%02d%02d%02d_%02d:%02d:%02d.%03d\r\n", sDate.Year, sDate.Month, sDate.Date, sTime.Hours, sTime.Minutes, sTime.Seconds, fsec);
-			//HAL_UART_Transmit(&huart2, datetime_str, strlen((char*)datetime_str), 100);
+		if ((transmitting == 0) && (fifo_status == SLOT_USED)){
 			fifo_status = SLOT_READING;
-			fill_tx_buffer();
-			fifo_status = SLOT_FREE;
 			transmit_buffer_DMA();
 		}
-		/*
-		strcpy((char*)datetime_str, "Hello\r\n");
-		HAL_UART_Transmit(&huart2, datetime_str, strlen((char*)datetime_str), 100);
-		HAL_Delay(1000);
-		 */
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -484,84 +469,84 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void fill_tx_buffer(){
-	// TODO: Compute CRC?
-	b64_encode((unsigned char*)&fifo[0], FIFO_WFLEN*2, (unsigned char*)&tx_dma_buffer);
-	int i = strlen((char*)tx_dma_buffer);
-	int j;
-	for (j=0; j < strlen((char*)datetime_str); j++){
-		tx_dma_buffer[i+j] = datetime_str[j];
-	}
-	tx_dma_buffer[i+j] = '-';
-	/* To Decode in python3:
-	 *  b = base64.b64decode(a[:-21])
-	 *  c = numpy.frombuffer(b,dtype=numpy.int16)
-	 * */
-}
-
 int transmit_buffer_DMA(){
-	transmitting = 1;
-	HAL_UART_Transmit_DMA(&huart2, (uint8_t*)tx_dma_buffer, strlen((char*)tx_dma_buffer));
+	HAL_UART_Transmit_DMA(
+		&huart2,
+		(uint8_t*)fifo[0],
+		HEADER_LEN + 2 * SAMPLES_IN_EVENT);
 	return 1;
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart){
+	fifo_status = SLOT_FREE;
 	transmitting = 0;
 }
 
-char* get_RTC_datetime(){
-	char *datetime_str = malloc(20);
+void write_RTC_datetime(unsigned char *datetime_str){
 	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
 	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-	sprintf(datetime_str, "%02d%02d%02d_%02d:%02d:%02d.%04ld\n\r", sDate.Year, sDate.Month, sDate.Date, sTime.Hours, sTime.Minutes, sTime.Seconds, (sTime.SubSeconds/sTime.SecondFraction) );
-	return datetime_str;
+	sprintf((char *) datetime_str,
+			"%02d%02d%02d_%02d:%02d:%02d.%03ld\r\n",
+			sDate.Year, sDate.Month, sDate.Date,
+			sTime.Hours, sTime.Minutes, sTime.Seconds,
+			(sTime.SubSeconds/sTime.SecondFraction) );
 }
 
 void copy_wf_to_fifo (){
+	event_number += 1;
+
 	if (fifo_status != SLOT_FREE){
 		// Can't record this waveform, no free buffer
 		active_trigger = 0;
 		return;
 	}
+	unsigned char* slot = fifo[0];
 	fifo_status = SLOT_WRITING;
 
-	uint16_t i;
-	if ( (active_trigger < ADC_BUF_LEN - FIFO_WFLEN) && (active_trigger > WF_PRE_SAMPLES) ){
-		/* The WF capture is in a sequential portion of memory */
-		for (i=0; i<FIFO_WFLEN; i++){
-			fifo[0][i] = adc_buf[i + active_trigger - WF_PRE_SAMPLES];
-		}
+	// Write the header
+	uint16_t i = 0;
+	memcpy(&slot[i], &event_number, sizeof(uint16_t));
+	i += 2;
+	write_RTC_datetime(&slot[i]);
+	i += 21;
+
+	int16_t event_start = active_trigger - WF_PRE_SAMPLES;
+	if (event_start < 0)
+		event_start = ADC_BUF_LEN + event_start;
+
+
+	if (event_start > (ADC_BUF_LEN - SAMPLES_IN_EVENT)){
+		// The event wraps around the buffer
+		// could in-line this... maybe compiler is nice enough to do this for us?
+		uint16_t samples_near_end = ADC_BUF_LEN - event_start;
+		uint16_t samples_near_start = SAMPLES_IN_EVENT - samples_near_end;
+		memcpy(&slot[i],
+			   &adc_buf[event_start],
+			   samples_near_end * sizeof(uint16_t));
+		i += samples_near_end * sizeof(uint16_t);
+		memcpy(&slot[i],
+			   &adc_buf[0],
+			   samples_near_start * sizeof(uint16_t));
 	}
-	else if (active_trigger > ADC_BUF_LEN - FIFO_WFLEN + WF_PRE_SAMPLES){
-		/* The WF starts near the end of ADC_BUF and some of the data
-		 * will be at the beginning of the buffer  */
-		uint16_t overlap = FIFO_WFLEN - (ADC_BUF_LEN - active_trigger) - WF_PRE_SAMPLES;
-		for ( i = active_trigger - WF_PRE_SAMPLES; i < ADC_BUF_LEN; i++ ){
-			fifo[0][i-active_trigger-WF_PRE_SAMPLES] = adc_buf[i];
-		}
-		tmp_a = i;
-		for ( i = 0; i < FIFO_WFLEN - overlap; i++ ){
-			fifo[0][FIFO_WFLEN - overlap + i] = adc_buf[i];
-		}
-		tmp_b = i;
-	}
-	else if (active_trigger < WF_PRE_SAMPLES){
-		/* The WF capture is close enough to the start of the ADC_BUF
-		 * that we need to start on the end of the circular buffer */
-		uint16_t overlap = WF_PRE_SAMPLES - active_trigger;
-		for ( i=0; i < overlap; i++ ){
-			fifo[0][i] = adc_buf[ADC_BUF_LEN - overlap + i];
-		}
-		tmp_c = i;
-		for ( i=0; i < FIFO_WFLEN - overlap; i++ ){
-			fifo[0][overlap + i] = adc_buf[i];
-		}
-		tmp_d = i;
+	else {
+		// The event is in sequential memory
+		memcpy(&slot[i],
+			   &adc_buf[event_start],
+			   SAMPLES_IN_EVENT * sizeof(uint16_t));
 	}
 
+	active_trigger = 0;
 	fifo_status = SLOT_USED;
-
 }
+
+int trigger_at(int i){
+	/* TODO: Think of a smarter trigger algorithm. This one
+	 * will still trigger in the tail if there is
+	 * sufficient noise.
+	 */
+	return adc_buf[i] > trig_threshold;
+}
+
 
 void HAL_ADC_ConvHalfCpltCallback (ADC_HandleTypeDef * hadc){
 	if (active_trigger != 0){
@@ -572,7 +557,7 @@ void HAL_ADC_ConvHalfCpltCallback (ADC_HandleTypeDef * hadc){
 	else {
 		/* look for a trigger in the half full buffer of new data */
 		for (int i=1; i < ADC_BUF_HLEN; i=i+1){
-			if (adc_buf[i] > trig_threshold) {
+			if (trigger_at(i)) {
 				active_trigger = i;
 				break;
 			}
@@ -594,7 +579,7 @@ void HAL_ADC_ConvCpltCallback (ADC_HandleTypeDef * hadc){
 	else {
 		/* look for a trigger in the half full buffer of new data */
 		for (int i=ADC_BUF_HLEN; i < ADC_BUF_LEN; i++){
-			if (adc_buf[i] > trig_threshold) {
+			if (trigger_at(i)) {
 				active_trigger = i;
 				break;
 			}
@@ -604,15 +589,6 @@ void HAL_ADC_ConvCpltCallback (ADC_HandleTypeDef * hadc){
 		/* there is an active trigger going into this buffer so
 		 * we only need to return the final waveform */
 		copy_wf_to_fifo();
-	}
-}
-
-void get_max_adc_first_half(){
-	uint16_t max_val = adc_buf[0];
-	for (int i=1; i < ADC_BUF_LEN/2; i=i+1){
-		if (adc_buf[i] > max_val) {
-			max_val = adc_buf[i];
-		}
 	}
 }
 
