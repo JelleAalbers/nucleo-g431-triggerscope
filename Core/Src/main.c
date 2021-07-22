@@ -39,7 +39,7 @@
 #define ADC_BUF_HLEN ADC_BUF_LEN/2
 #define HEADER_LEN 24   // 2 for trigger_number, 1 for fifo slot number, 21 for datestring
 #define SAMPLES_IN_EVENT 500
-#define FIFO_NUMWF 4
+#define FIFO_NUMWF 8
 #define WF_PRE_SAMPLES 50
 
 #define SLOT_FREE 0      // but memory may be old junk
@@ -79,6 +79,7 @@ int fifo_status[FIFO_NUMWF];
 uint16_t fifo_event_number[FIFO_NUMWF]; // valid if status is SLOT_FULL, junk otherwise
 uint16_t event_number;
 int transmitting_slot = -1;
+int transmit_n = 0;
 
 /* USER CODE END PV */
 
@@ -145,7 +146,6 @@ int main(void)
 		if (transmitting_slot != -1) continue;
 
 		// Find earliest untransmitted waveform in buffer
-		// TODO: .. but event number wraps around!
 		int earliest_slot = -1;
 		uint16_t earliest_event_number = 0;
 		for (int i = 0; i < FIFO_NUMWF; i++){
@@ -158,12 +158,24 @@ int main(void)
 		}
 		if (earliest_slot == -1) continue;
 
+		// Can we transmit any additional events right after it?
+		transmit_n = 1;
+		for (int i = earliest_slot + 1; i < FIFO_NUMWF; i++){
+			if (fifo_status[i] == SLOT_FULL){
+				transmit_n += 1;
+			} else {
+				break;
+			}
+		}
+
 		transmitting_slot = earliest_slot;
-		fifo_status[transmitting_slot] = SLOT_READING;
+		for (int i = 0; i < transmit_n; i++){
+			fifo_status[transmitting_slot + i] = SLOT_READING;
+		}
 		HAL_UART_Transmit_DMA(
 				&huart2,
 				(uint8_t*)fifo[transmitting_slot],
-				HEADER_LEN + 2 * SAMPLES_IN_EVENT);
+				transmit_n * (HEADER_LEN + 2 * SAMPLES_IN_EVENT));
 
     /* USER CODE END WHILE */
 
@@ -488,7 +500,9 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart){
-	fifo_status[transmitting_slot] = SLOT_FREE;
+	for (int i = 0; i < transmit_n; i++){
+		fifo_status[transmitting_slot + i] = SLOT_FREE;
+	}
 	transmitting_slot = -1;
 }
 
