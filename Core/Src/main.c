@@ -39,7 +39,7 @@
 #define ADC_BUF_HLEN ADC_BUF_LEN/2
 #define HEADER_LEN 24   // 2 for trigger_number, 1 for fifo slot number, 21 for datestring
 #define SAMPLES_IN_EVENT 500
-#define FIFO_NUMWF 8
+#define FIFO_NUMWF 16
 #define WF_PRE_SAMPLES 50
 
 #define SLOT_FREE 0      // but memory may be old junk
