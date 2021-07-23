@@ -46,13 +46,14 @@
 
 #define ADC_BUF_HLEN ADC_BUF_LEN/2
 
-/* Packet footer:
+/* Packet footer (32 bytes)
  * 4 byte uint32: event/trigger number
  * 1 byte int: fifo slot number (for debugging)
  * 19 byte ASCII string: yymmdd_hh:mm:ss.qqq, with 1 Jan 2000 = device startup
- * 8 byte magic terminator: !~O_o~\r\n
+ * 8 byte magic terminator: !~O_o~! + null character
  */
-#define FOOTER_LEN 32
+#define DATE_AND_TERMINATOR_LENGTH 19 + 8
+#define FOOTER_LEN 4 + 1 + DATE_AND_TERMINATOR_LENGTH
 #define BYTES_PER_SAMPLE 2
 #define EVENT_SIZE (SAMPLES_IN_EVENT * BYTES_PER_SAMPLE + FOOTER_LEN)
 
@@ -534,11 +535,12 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart){
 void write_RTC_datetime(unsigned char *datetime_str){
 	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
 	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
-	sprintf((char *) datetime_str,
-			"%02d%02d%02d_%02d:%02d:%02d.%03ld!~O_o~\r\n",
-			sDate.Year, sDate.Month, sDate.Date,
-			sTime.Hours, sTime.Minutes, sTime.Seconds,
-			((1000 * sTime.SubSeconds)/sTime.SecondFraction) );
+	snprintf((char *) datetime_str,
+			 DATE_AND_TERMINATOR_LENGTH,
+             "%02d%02d%02d_%02d:%02d:%02d.%03ld!~O_o~!",
+ 			 sDate.Year, sDate.Month, sDate.Date,
+ 			 sTime.Hours, sTime.Minutes, sTime.Seconds,
+			 ((1000 * sTime.SubSeconds)/sTime.SecondFraction) );
 }
 
 void copy_wf_to_fifo (){
@@ -606,7 +608,7 @@ void copy_wf_to_fifo (){
 
 	// Datetime string
 	write_RTC_datetime(&slot[pos]);
-	pos += 27;
+	pos += DATE_AND_TERMINATOR_LENGTH;
 
 	active_trigger = 0;
 	fifo_status[free_slot_i] = SLOT_FULL;
