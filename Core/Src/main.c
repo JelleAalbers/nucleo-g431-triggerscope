@@ -40,11 +40,7 @@
 #define TRIGGER_THRESHOLD 100
 #define SAMPLES_IN_EVENT 500
 #define WF_PRE_SAMPLES 50		  // Samples to include before trigger
-#define ADC_BUFFER_SAMPLES 10 * SAMPLES_IN_EVENT
-/* Holdoff should be between
- * ADC_BUFFER_SAMPLES /2 + SAMPLES_IN_EVENT - PRE_SAMPLES
- * and ADC_BUFFER_SAMPLES.  */
-#define TRIGGER_HOLDOFF_SAMPLES ADC_BUFFER_SAMPLES - 10
+#define ADC_BUFFER_SAMPLES 3 * SAMPLES_IN_EVENT
 #define FIFO_NUMWF 4
 
 
@@ -96,9 +92,6 @@ uint16_t adc_buf[ADC_BUFFER_SAMPLES];
 
 // Index in adc_buf of the trigger currently being processed
 int16_t active_trigger = NO_ACTIVE_TRIGGER;
-// Trigger holdoff until this ADC buffer index
-// (will be reset once walked past, so don't fear wraparounds)
-uint32_t holdoff_until;
 
 // Buffer holding waveforms before transmission
 unsigned char fifo[FIFO_NUMWF][EVENT_SIZE];
@@ -176,7 +169,7 @@ int main(void)
 
 		// Find earliest untransmitted waveform in buffer
 		int earliest_slot = -1;
-		uint16_t earliest_event_number = 0;
+		uint32_t earliest_event_number = 0;
 		for (int i = 0; i < FIFO_NUMWF; i++){
 			if ((fifo_status[i] == SLOT_FULL)
 					&& ((earliest_slot == -1)
@@ -614,24 +607,11 @@ void check_half_buffer_for_trigger(int start_i){
 	} else {
 		/* look for a trigger in the half full buffer of new data */
 		for (int i=start_i; i < start_i + ADC_HALF_BUFFER_SAMPLES; i=i+1){
-			if ((i > holdoff_until) && (adc_buf[i] > TRIGGER_THRESHOLD)) {
+			if (adc_buf[i] > TRIGGER_THRESHOLD) {
 				active_trigger = i;
-				holdoff_until = active_trigger + TRIGGER_HOLDOFF_SAMPLES;
-				// For some reason % ADC_BUFFER_SAMPLES gives trouble...
-				if (holdoff_until >= ADC_BUFFER_SAMPLES){
-					holdoff_until -= ADC_BUFFER_SAMPLES;
-				}
 				break;
 			}
 		}
-	}
-
-	if ((active_trigger == NO_ACTIVE_TRIGGER)
-			&& (start_i + ADC_HALF_BUFFER_SAMPLES) > holdoff_until){
-		/* We found no event, but walked passed the holdoff value.
-		 * Reset the holdoff to 0 so the next half-buffer is fully searched.
-		 */
-		holdoff_until = 0;
 	}
 
 	if (active_trigger != NO_ACTIVE_TRIGGER
