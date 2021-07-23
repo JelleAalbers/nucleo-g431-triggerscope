@@ -22,10 +22,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+
 #include <stdio.h>
 #include <stdlib.h>   // malloc
 #include <string.h>
-#include "base64.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,17 +36,31 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ADC_BUF_LEN 2064
-#define ADC_BUF_HLEN ADC_BUF_LEN/2
-#define HEADER_LEN 24   // 2 for trigger_number, 1 for fifo slot number, 21 for datestring
-#define SAMPLES_IN_EVENT 500
-#define FIFO_NUMWF 16
-#define WF_PRE_SAMPLES 50
 
-#define SLOT_FREE 0      // but memory may be old junk
+#define TRIGGER_THRESHOLD 100
+#define SAMPLES_IN_EVENT 500
+#define WF_PRE_SAMPLES 50		// Samples to include before trigger
+
+#define ADC_BUF_LEN 4128
+#define ADC_BUF_HLEN ADC_BUF_LEN/2
+
+#define FIFO_NUMWF 4
+
+/* Packet footer:
+ * 4 byte uint32: event/trigger number
+ * 1 byte int: fifo slot number (for debugging)
+ * 19 byte ASCII string: yymmdd_hh:mm:ss.qqq, with 1 Jan 2000 = device startup
+ * 7 byte magic terminator: ~O_o~\r\n
+ */
+#define FOOTER_LEN 31
+
+#define SLOT_FREE 0      // memory will be old junk, don't assume it's 0
 #define SLOT_WRITING 1
 #define SLOT_FULL 2
 #define SLOT_READING 3
+
+#define BYTES_PER_SAMPLE 2
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,6 +80,7 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
+
 RTC_TimeTypeDef sTime;
 RTC_DateTypeDef sDate;
 
@@ -72,14 +88,16 @@ uint16_t adc_buf[ADC_BUF_LEN];
 /* the register where the threshold was meet, so need to be able to hold a value
  * up to ADC_BUF_LEN */
 int16_t active_trigger;
-uint16_t trig_threshold = 100;
 
-unsigned char fifo[FIFO_NUMWF][HEADER_LEN + 2 * SAMPLES_IN_EVENT];
-int fifo_status[FIFO_NUMWF];
-uint16_t fifo_event_number[FIFO_NUMWF]; // valid if status is SLOT_FULL, junk otherwise
-uint16_t event_number;
-int transmitting_slot = -1;
-int transmit_n = 0;
+// Buffer holding waveforms before transmission
+unsigned char fifo[FIFO_NUMWF][FOOTER_LEN + 2 * SAMPLES_IN_EVENT];
+int fifo_status[FIFO_NUMWF];            // See SLOT_XXX defines. Could enum...
+uint32_t fifo_event_number[FIFO_NUMWF]; // valid if SLOT_FULL, junk otherwise
+
+uint32_t event_number;   // Number for the next observed event
+
+int transmitting_slot = -1;  // If >0, fifo slot that is being sent over UART...
+int transmit_n = 0;          // Number of slots pending over UART (0/1 for now)
 
 /* USER CODE END PV */
 
@@ -179,7 +197,7 @@ int main(void)
 		HAL_UART_Transmit_DMA(
 				&huart2,
 				(uint8_t*)fifo[transmitting_slot],
-				transmit_n * (HEADER_LEN + 2 * SAMPLES_IN_EVENT));
+				transmit_n * (FOOTER_LEN + 2 * SAMPLES_IN_EVENT));
 
     /* USER CODE END WHILE */
 
@@ -510,14 +528,20 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart){
 	transmitting_slot = -1;
 }
 
+void HAL_UART_ErrorCallback(UART_HandleTypeDef * huart){
+	// Ignore any error!!
+	HAL_UART_TxCpltCallback(huart);
+}
+
+
 void write_RTC_datetime(unsigned char *datetime_str){
 	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
 	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 	sprintf((char *) datetime_str,
-			"%02d%02d%02d_%02d:%02d:%02d.%03ld\r\n",
+			"%02d%02d%02d_%02d:%02d:%02d.%03ld~O_o~\r\n",
 			sDate.Year, sDate.Month, sDate.Date,
 			sTime.Hours, sTime.Minutes, sTime.Seconds,
-			(sTime.SubSeconds/sTime.SecondFraction) );
+			(1000 * sTime.SubSeconds/sTime.SecondFraction) );
 }
 
 void copy_wf_to_fifo (){
@@ -537,15 +561,47 @@ void copy_wf_to_fifo (){
 		active_trigger = 0;
 		return;
 	}
+
 	fifo_status[free_slot_i] = SLOT_WRITING;
 	fifo_event_number[free_slot_i] = event_number;
 
+	// Index in adc_buf where the event starts
+	int16_t event_start = active_trigger - WF_PRE_SAMPLES;
+	if (event_start < 0)
+		event_start = ADC_BUF_LEN + event_start;
+
+	// Form a waveform packet inside our assigned fifo slot
+	// pos tracks our position / bytes written
 	unsigned char* slot = fifo[free_slot_i];
 	uint16_t pos = 0;
 
+	// Copy over the data (BYTES_PER_SAMPLE * SAMPLES_IN_EVENT bytes)
+	if (event_start > (ADC_BUF_LEN - SAMPLES_IN_EVENT)){
+		// The event wraps around the buffer
+		// could in-line this... maybe compiler is nice enough to do this for us?
+		uint16_t samples_near_end = ADC_BUF_LEN - event_start;
+		uint16_t samples_near_start = SAMPLES_IN_EVENT - samples_near_end;
+		memcpy(&slot[pos],
+               &adc_buf[event_start],
+               samples_near_end * BYTES_PER_SAMPLE);
+		pos += samples_near_end * BYTES_PER_SAMPLE;
+		memcpy(&slot[pos],
+			   &adc_buf[0],
+			   samples_near_start * BYTES_PER_SAMPLE);
+		pos += samples_near_start * BYTES_PER_SAMPLE;
+	}
+	else {
+		// The event is in sequential memory
+		memcpy(&slot[pos],
+			   &adc_buf[event_start],
+			   SAMPLES_IN_EVENT * BYTES_PER_SAMPLE);
+		pos += SAMPLES_IN_EVENT * BYTES_PER_SAMPLE;
+	}
+
+
 	// Event number
-	memcpy(&slot[pos], &event_number, sizeof(uint16_t));
-	pos += 2;
+	memcpy(&slot[pos], &event_number, sizeof(event_number));   // TODO: sizeof(var) is clearer, try it
+	pos += sizeof(event_number);
 
 	// FIFO slot number
 	slot[pos] = (unsigned char)free_slot_i;
@@ -553,31 +609,7 @@ void copy_wf_to_fifo (){
 
 	// Datetime string
 	write_RTC_datetime(&slot[pos]);
-	pos += 21;
-
-	int16_t event_start = active_trigger - WF_PRE_SAMPLES;
-	if (event_start < 0)
-		event_start = ADC_BUF_LEN + event_start;
-
-	if (event_start > (ADC_BUF_LEN - SAMPLES_IN_EVENT)){
-		// The event wraps around the buffer
-		// could in-line this... maybe compiler is nice enough to do this for us?
-		uint16_t samples_near_end = ADC_BUF_LEN - event_start;
-		uint16_t samples_near_start = SAMPLES_IN_EVENT - samples_near_end;
-		memcpy(&slot[pos],
-			   &adc_buf[event_start],
-			   samples_near_end * sizeof(uint16_t));
-		pos += samples_near_end * sizeof(uint16_t);
-		memcpy(&slot[pos],
-			   &adc_buf[0],
-			   samples_near_start * sizeof(uint16_t));
-	}
-	else {
-		// The event is in sequential memory
-		memcpy(&slot[pos],
-			   &adc_buf[event_start],
-			   SAMPLES_IN_EVENT * sizeof(uint16_t));
-	}
+	pos += 26;
 
 	active_trigger = 0;
 	fifo_status[free_slot_i] = SLOT_FULL;
@@ -588,7 +620,7 @@ int trigger_at(int i){
 	 * will still trigger in the tail if there is
 	 * sufficient noise.
 	 */
-	return adc_buf[i] > trig_threshold;
+	return adc_buf[i] > TRIGGER_THRESHOLD;
 }
 
 
