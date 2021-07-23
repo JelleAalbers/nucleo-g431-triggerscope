@@ -40,26 +40,28 @@
 #define TRIGGER_THRESHOLD 100
 #define SAMPLES_IN_EVENT 500
 #define WF_PRE_SAMPLES 50		// Samples to include before trigger
-
-#define ADC_BUF_LEN 4128
-#define ADC_BUF_HLEN ADC_BUF_LEN/2
-
 #define FIFO_NUMWF 4
+
+#define ADC_BUF_LEN 2064
+
+#define ADC_BUF_HLEN ADC_BUF_LEN/2
 
 /* Packet footer:
  * 4 byte uint32: event/trigger number
  * 1 byte int: fifo slot number (for debugging)
  * 19 byte ASCII string: yymmdd_hh:mm:ss.qqq, with 1 Jan 2000 = device startup
- * 7 byte magic terminator: ~O_o~\r\n
+ * 8 byte magic terminator: !~O_o~\r\n
  */
-#define FOOTER_LEN 31
+#define FOOTER_LEN 32
+#define BYTES_PER_SAMPLE 2
+#define EVENT_SIZE (SAMPLES_IN_EVENT * BYTES_PER_SAMPLE + FOOTER_LEN)
 
 #define SLOT_FREE 0      // memory will be old junk, don't assume it's 0
 #define SLOT_WRITING 1
 #define SLOT_FULL 2
 #define SLOT_READING 3
 
-#define BYTES_PER_SAMPLE 2
+
 
 /* USER CODE END PD */
 
@@ -90,7 +92,7 @@ uint16_t adc_buf[ADC_BUF_LEN];
 int16_t active_trigger;
 
 // Buffer holding waveforms before transmission
-unsigned char fifo[FIFO_NUMWF][FOOTER_LEN + 2 * SAMPLES_IN_EVENT];
+unsigned char fifo[FIFO_NUMWF][EVENT_SIZE];
 int fifo_status[FIFO_NUMWF];            // See SLOT_XXX defines. Could enum...
 uint32_t fifo_event_number[FIFO_NUMWF]; // valid if SLOT_FULL, junk otherwise
 
@@ -197,7 +199,7 @@ int main(void)
 		HAL_UART_Transmit_DMA(
 				&huart2,
 				(uint8_t*)fifo[transmitting_slot],
-				transmit_n * (FOOTER_LEN + 2 * SAMPLES_IN_EVENT));
+				transmit_n * EVENT_SIZE);
 
     /* USER CODE END WHILE */
 
@@ -528,20 +530,15 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart){
 	transmitting_slot = -1;
 }
 
-void HAL_UART_ErrorCallback(UART_HandleTypeDef * huart){
-	// Ignore any error!!
-	HAL_UART_TxCpltCallback(huart);
-}
-
 
 void write_RTC_datetime(unsigned char *datetime_str){
 	HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
 	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
 	sprintf((char *) datetime_str,
-			"%02d%02d%02d_%02d:%02d:%02d.%03ld~O_o~\r\n",
+			"%02d%02d%02d_%02d:%02d:%02d.%03ld!~O_o~\r\n",
 			sDate.Year, sDate.Month, sDate.Date,
 			sTime.Hours, sTime.Minutes, sTime.Seconds,
-			(1000 * sTime.SubSeconds/sTime.SecondFraction) );
+			((1000 * sTime.SubSeconds)/sTime.SecondFraction) );
 }
 
 void copy_wf_to_fifo (){
@@ -609,7 +606,7 @@ void copy_wf_to_fifo (){
 
 	// Datetime string
 	write_RTC_datetime(&slot[pos]);
-	pos += 26;
+	pos += 27;
 
 	active_trigger = 0;
 	fifo_status[free_slot_i] = SLOT_FULL;
