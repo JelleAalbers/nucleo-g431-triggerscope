@@ -38,7 +38,7 @@
 /* USER CODE BEGIN PD */
 
 #define TRIGGER_THRESHOLD 100
-#define SAMPLES_IN_EVENT 500
+#define SAMPLES_IN_EVENT 1000
 #define WF_PRE_SAMPLES 50		  // Samples to include before trigger
 #define ADC_BUFFER_SAMPLES 3 * SAMPLES_IN_EVENT
 #define FIFO_NUMWF 4
