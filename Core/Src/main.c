@@ -39,13 +39,16 @@
 
 #define TRIGGER_THRESHOLD 100
 #define SAMPLES_IN_EVENT 500
-#define WF_PRE_SAMPLES 50		// Samples to include before trigger
+#define WF_PRE_SAMPLES 50		  // Samples to include before trigger
+#define ADC_BUFFER_SAMPLES 10 * SAMPLES_IN_EVENT
+/* Holdoff should be between
+ * ADC_BUFFER_SAMPLES /2 + SAMPLES_IN_EVENT - PRE_SAMPLES
+ * and ADC_BUFFER_SAMPLES.  */
+#define TRIGGER_HOLDOFF_SAMPLES ADC_BUFFER_SAMPLES - 10
 #define FIFO_NUMWF 4
 
-#define ADC_BUF_LEN 2064
 
-#define ADC_BUF_HLEN ADC_BUF_LEN/2
-
+#define ADC_HALF_BUFFER_SAMPLES ADC_BUFFER_SAMPLES/2
 /* Packet footer (32 bytes)
  * 4 byte uint32: event/trigger number
  * 1 byte int: fifo slot number (for debugging)
@@ -60,8 +63,10 @@
 #define SLOT_FREE 0      // memory will be old junk, don't assume it's 0
 #define SLOT_WRITING 1
 #define SLOT_FULL 2
-#define SLOT_READING 3
+#define SLOT_TRANSMITTING 3
 
+#define NO_ACTIVE_TRIGGER -1
+#define NOT_TRANSMITTING -1
 
 
 /* USER CODE END PD */
@@ -87,10 +92,13 @@ DMA_HandleTypeDef hdma_usart2_tx;
 RTC_TimeTypeDef sTime;
 RTC_DateTypeDef sDate;
 
-uint16_t adc_buf[ADC_BUF_LEN];
-/* the register where the threshold was meet, so need to be able to hold a value
- * up to ADC_BUF_LEN */
-int16_t active_trigger;
+uint16_t adc_buf[ADC_BUFFER_SAMPLES];
+
+// Index in adc_buf of the trigger currently being processed
+int16_t active_trigger = NO_ACTIVE_TRIGGER;
+// Trigger holdoff until this ADC buffer index
+// (will be reset once walked past, so don't fear wraparounds)
+uint32_t holdoff_until;
 
 // Buffer holding waveforms before transmission
 unsigned char fifo[FIFO_NUMWF][EVENT_SIZE];
@@ -99,8 +107,8 @@ uint32_t fifo_event_number[FIFO_NUMWF]; // valid if SLOT_FULL, junk otherwise
 
 uint32_t event_number;   // Number for the next observed event
 
-int transmitting_slot = -1;  // If >0, fifo slot that is being sent over UART...
-int transmit_n = 0;          // Number of slots pending over UART (0/1 for now)
+// Fifo slot that is being sent over UART
+int transmitting_slot = NOT_TRANSMITTING;
 
 /* USER CODE END PV */
 
@@ -157,14 +165,14 @@ int main(void)
   MX_CRC_Init();
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
-	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUFFER_SAMPLES);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 	while (1)
 	{
-		if (transmitting_slot != -1) continue;
+		if (transmitting_slot != NOT_TRANSMITTING) continue;
 
 		// Find earliest untransmitted waveform in buffer
 		int earliest_slot = -1;
@@ -179,28 +187,13 @@ int main(void)
 		}
 		if (earliest_slot == -1) continue;
 
-		// Can we transmit any additional events right after it?
-		// TODO: Try again once I find out how to increase the serial buffer size
-		// (without that it does not work)
-		transmit_n = 1;
-		/*
-		for (int i = earliest_slot + 1; i < FIFO_NUMWF; i++){
-			if (fifo_status[i] == SLOT_FULL){
-				transmit_n += 1;
-			} else {
-				break;
-			}
-		}
-		*/
 
 		transmitting_slot = earliest_slot;
-		for (int i = 0; i < transmit_n; i++){
-			fifo_status[transmitting_slot + i] = SLOT_READING;
-		}
+		fifo_status[transmitting_slot] = SLOT_TRANSMITTING;
 		HAL_UART_Transmit_DMA(
 				&huart2,
 				(uint8_t*)fifo[transmitting_slot],
-				transmit_n * EVENT_SIZE);
+				EVENT_SIZE);
 
     /* USER CODE END WHILE */
 
@@ -525,10 +518,8 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart){
-	for (int i = 0; i < transmit_n; i++){
-		fifo_status[transmitting_slot + i] = SLOT_FREE;
-	}
-	transmitting_slot = -1;
+	fifo_status[transmitting_slot] = SLOT_FREE;
+	transmitting_slot = NOT_TRANSMITTING;
 }
 
 
@@ -556,8 +547,7 @@ void copy_wf_to_fifo (){
 	}
 	if (free_slot_i == -1) {
 		// Can't save this trigger, no free slot
-		// TODO: 0 is not a good null value! Trigger could be at 0...
-		active_trigger = 0;
+		active_trigger = NO_ACTIVE_TRIGGER;
 		return;
 	}
 
@@ -567,7 +557,7 @@ void copy_wf_to_fifo (){
 	// Index in adc_buf where the event starts
 	int16_t event_start = active_trigger - WF_PRE_SAMPLES;
 	if (event_start < 0)
-		event_start = ADC_BUF_LEN + event_start;
+		event_start = ADC_BUFFER_SAMPLES + event_start;
 
 	// Form a waveform packet inside our assigned fifo slot
 	// pos tracks our position / bytes written
@@ -575,10 +565,10 @@ void copy_wf_to_fifo (){
 	uint16_t pos = 0;
 
 	// Copy over the data (BYTES_PER_SAMPLE * SAMPLES_IN_EVENT bytes)
-	if (event_start > (ADC_BUF_LEN - SAMPLES_IN_EVENT)){
+	if (event_start > (ADC_BUFFER_SAMPLES - SAMPLES_IN_EVENT)){
 		// The event wraps around the buffer
 		// could in-line this... maybe compiler is nice enough to do this for us?
-		uint16_t samples_near_end = ADC_BUF_LEN - event_start;
+		uint16_t samples_near_end = ADC_BUFFER_SAMPLES - event_start;
 		uint16_t samples_near_start = SAMPLES_IN_EVENT - samples_near_end;
 		memcpy(&slot[pos],
                &adc_buf[event_start],
@@ -610,61 +600,54 @@ void copy_wf_to_fifo (){
 	write_RTC_datetime(&slot[pos]);
 	pos += DATE_AND_TERMINATOR_LENGTH;
 
-	active_trigger = 0;
+	active_trigger = NO_ACTIVE_TRIGGER;
 	fifo_status[free_slot_i] = SLOT_FULL;
 }
 
-int trigger_at(int i){
-	/* TODO: Think of a smarter trigger algorithm. This one
-	 * will still trigger in the tail if there is
-	 * sufficient noise.
-	 */
-	return adc_buf[i] > TRIGGER_THRESHOLD;
+
+void check_half_buffer_for_trigger(int start_i){
+	if (active_trigger != NO_ACTIVE_TRIGGER){
+		/* There was a trigger in the previous half buffer,
+		 * but it needed data from this half to complete the waveform */
+		copy_wf_to_fifo();
+
+	} else {
+		/* look for a trigger in the half full buffer of new data */
+		for (int i=start_i; i < start_i + ADC_HALF_BUFFER_SAMPLES; i=i+1){
+			if ((i > holdoff_until) && (adc_buf[i] > TRIGGER_THRESHOLD)) {
+				active_trigger = i;
+				holdoff_until = active_trigger + TRIGGER_HOLDOFF_SAMPLES;
+				// For some reason % ADC_BUFFER_SAMPLES gives trouble...
+				if (holdoff_until >= ADC_BUFFER_SAMPLES){
+					holdoff_until -= ADC_BUFFER_SAMPLES;
+				}
+				break;
+			}
+		}
+	}
+
+	if ((active_trigger == NO_ACTIVE_TRIGGER)
+			&& (start_i + ADC_HALF_BUFFER_SAMPLES) > holdoff_until){
+		/* We found no event, but walked passed the holdoff value.
+		 * Reset the holdoff to 0 so the next half-buffer is fully searched.
+		 */
+		holdoff_until = 0;
+	}
+
+	if (active_trigger != NO_ACTIVE_TRIGGER
+			&& (active_trigger < start_i + ADC_HALF_BUFFER_SAMPLES - (SAMPLES_IN_EVENT - WF_PRE_SAMPLES))) {
+		// The entire event we found lies in this half-buffer, so just copy it out */
+		copy_wf_to_fifo();
+	}
 }
 
 
 void HAL_ADC_ConvHalfCpltCallback (ADC_HandleTypeDef * hadc){
-	if (active_trigger != 0){
-		/* There is an active trigger in the previous half but
-		 * it needed data from this half to complete the WF*/
-		copy_wf_to_fifo();
-	}
-	else {
-		/* look for a trigger in the half full buffer of new data */
-		for (int i=1; i < ADC_BUF_HLEN; i=i+1){
-			if (trigger_at(i)) {
-				active_trigger = i;
-				break;
-			}
-		}
-	}
-	if (active_trigger !=0 && active_trigger < ADC_BUF_HLEN-450) {
-		/* there is an active trigger going into this buffer so
-		 * we only need to return the final waveform */
-		copy_wf_to_fifo();
-	}
+	check_half_buffer_for_trigger(0);
 }
 
 void HAL_ADC_ConvCpltCallback (ADC_HandleTypeDef * hadc){
-	if (active_trigger != 0){
-		/* There is an active trigger in the previous half but
-		 * it needed data from this half to complete the WF*/
-		copy_wf_to_fifo();
-	}
-	else {
-		/* look for a trigger in the half full buffer of new data */
-		for (int i=ADC_BUF_HLEN; i < ADC_BUF_LEN; i++){
-			if (trigger_at(i)) {
-				active_trigger = i;
-				break;
-			}
-		}
-	}
-	if (active_trigger !=0 && active_trigger < ADC_BUF_LEN-450) {
-		/* there is an active trigger going into this buffer so
-		 * we only need to return the final waveform */
-		copy_wf_to_fifo();
-	}
+	check_half_buffer_for_trigger(ADC_HALF_BUFFER_SAMPLES);
 }
 
 
