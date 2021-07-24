@@ -524,7 +524,7 @@ void write_RTC_datetime(unsigned char *datetime_str){
              "%02d%02d%02d_%02d:%02d:%02d.%03ld!~O_o~!",
  			 sDate.Year, sDate.Month, sDate.Date,
  			 sTime.Hours, sTime.Minutes, sTime.Seconds,
-			 ((1000 * sTime.SubSeconds)/sTime.SecondFraction) );
+			 (1000 - (1000 * sTime.SubSeconds)/sTime.SecondFraction) );
 }
 
 void copy_wf_to_fifo (){
